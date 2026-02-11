@@ -1,11 +1,31 @@
 #!/usr/bin/env python3
-"""Daily GitHub PR report generator using gh CLI."""
+"""Daily GitHub PR report generator using hybrid local-git + GraphQL approach.
+
+Three-phase pipeline:
+  Phase 1: Commit discovery via local git repos + GraphQL API fallback
+  Phase 2: Review discovery via GraphQL search
+  Phase 3: PR detail enrichment via GraphQL batch queries
+
+Falls back to GraphQL-only mode when no local repos are configured.
+"""
 
 import argparse
 import json
 import subprocess
 import sys
 from datetime import datetime, date
+
+from config import load_config, Config
+from git_local import discover_repos, fetch_repos, find_commits, extract_pr_numbers, RepoInfo
+from graphql_client import (
+    graphql_with_retry,
+    build_pr_details_query,
+    parse_pr_details_response,
+    build_commit_to_pr_query,
+    parse_commit_to_pr_response,
+    build_review_search_query,
+    build_waiting_for_review_query,
+)
 
 
 # AI bots to exclude from reviewer lists
@@ -42,15 +62,6 @@ def gh_json(args):
     return json.loads(output)
 
 
-def gh_search(query_args, json_fields):
-    """Run gh search prs and return parsed JSON list."""
-    fields = ",".join(json_fields)
-    try:
-        return gh_json(["search", "prs"] + query_args + ["--json", fields])
-    except RuntimeError:
-        return []
-
-
 def get_current_user():
     """Get the authenticated GitHub username."""
     try:
@@ -59,142 +70,6 @@ def get_current_user():
     except (RuntimeError, KeyError, TypeError):
         print("Error: gh CLI is not authenticated. Run 'gh auth login'.", file=sys.stderr)
         sys.exit(1)
-
-
-def repo_name(pr):
-    """Extract repository name from a PR object."""
-    repo = pr.get("repository", {})
-    if isinstance(repo, dict):
-        return repo.get("name", "")
-    return str(repo)
-
-
-def pr_key(pr):
-    """Return a unique key for deduplication."""
-    return (repo_name(pr), pr["number"])
-
-
-def deduplicate(prs):
-    """Deduplicate PRs by (repo, number)."""
-    seen = set()
-    result = []
-    for pr in prs:
-        key = pr_key(pr)
-        if key not in seen:
-            seen.add(key)
-            result.append(pr)
-    return result
-
-
-def get_repo_fullname(pr, org):
-    """Get the full 'org/repo' string."""
-    return f"{org}/{repo_name(pr)}"
-
-
-def get_pr_detail(org, repo, number, jq_expr=None):
-    """Fetch PR detail via gh api."""
-    args = ["api", f"repos/{org}/{repo}/pulls/{number}"]
-    if jq_expr:
-        args += ["--jq", jq_expr]
-    try:
-        return gh_json(args) if not jq_expr else gh_command(args)
-    except RuntimeError:
-        return None
-
-
-def check_commits_for_user(org, repo, number, user, date_from, date_to):
-    """Check if user has commits on a PR within [date_from, date_to]."""
-    try:
-        commits = gh_json(["api", f"repos/{org}/{repo}/pulls/{number}/commits"])
-    except RuntimeError:
-        return False
-    for commit in commits:
-        author_login = (commit.get("author") or {}).get("login", "")
-        committer_login = (commit.get("committer") or {}).get("login", "")
-        if author_login == user or committer_login == user:
-            commit_info = commit.get("commit", {})
-            for date_field in ("author", "committer"):
-                date_str = (commit_info.get(date_field) or {}).get("date", "")
-                if date_str and date_from <= date_str[:10] <= date_to:
-                    return True
-    return False
-
-
-def check_review_activity(org, repo, number, user, date_from, date_to):
-    """Check if user has review or comment activity on a PR within [date_from, date_to]."""
-    # Check reviews
-    try:
-        reviews_output = gh_command([
-            "api", f"repos/{org}/{repo}/pulls/{number}/reviews",
-            "--jq", f'.[] | select(.user.login == "{user}") | .submitted_at',
-        ])
-        if reviews_output:
-            for line in reviews_output.splitlines():
-                review_date = line.strip()[:10]
-                if date_from <= review_date <= date_to:
-                    return True
-    except RuntimeError:
-        pass
-
-    # Check issue comments
-    try:
-        comments_output = gh_command([
-            "api", f"repos/{org}/{repo}/issues/{number}/comments",
-            "--jq", f'.[] | select(.user.login == "{user}") | .created_at',
-        ])
-        if comments_output:
-            for line in comments_output.splitlines():
-                comment_date = line.strip()[:10]
-                if date_from <= comment_date <= date_to:
-                    return True
-    except RuntimeError:
-        pass
-
-    return False
-
-
-def get_additions_deletions(org, repo, number):
-    """Get +/- stats for a PR."""
-    try:
-        data = gh_json(["api", f"repos/{org}/{repo}/pulls/{number}"])
-        return data.get("additions", 0), data.get("deletions", 0)
-    except RuntimeError:
-        return 0, 0
-
-
-def get_merged_info(org, repo, number):
-    """Get merged_at and state for a PR."""
-    try:
-        data = gh_json(["api", f"repos/{org}/{repo}/pulls/{number}"])
-        return data.get("merged_at"), data.get("state", "")
-    except RuntimeError:
-        return None, ""
-
-
-def get_requested_reviewers(org, repo, number, user):
-    """Get pending requested reviewers, excluding bots and the user."""
-    try:
-        data = gh_json(["api", f"repos/{org}/{repo}/pulls/{number}/requested_reviewers"])
-    except RuntimeError:
-        return []
-    reviewers = []
-    for u in data.get("users", []):
-        login = u.get("login", "")
-        if login and login not in AI_BOTS and login != user:
-            reviewers.append(login)
-    for t in data.get("teams", []):
-        slug = t.get("slug", "")
-        if slug and slug not in AI_BOTS:
-            reviewers.append(slug)
-    return reviewers
-
-
-def pr_author_login(pr):
-    """Extract PR author login."""
-    author = pr.get("author", {})
-    if isinstance(author, dict):
-        return author.get("login", "")
-    return str(author)
 
 
 def extract_themes(titles):
@@ -227,6 +102,161 @@ def format_status(state, is_draft, merged_at=None):
     return "Open"
 
 
+# ---------------------------------------------------------------------------
+# Phase 1 helpers
+# ---------------------------------------------------------------------------
+
+def _build_authored_search_query(org, user, date_from, date_to):
+    """Build a GraphQL search query for authored PRs (API fallback)."""
+    date_query = f"{date_from}..{date_to}" if date_from != date_to else date_from
+    query = """\
+query AuthoredSearch($createdQuery: String!, $updatedQuery: String!) {
+  created: search(query: $createdQuery, type: ISSUE, first: 100) {
+    nodes {
+      ... on PullRequest {
+        number
+        title
+        state
+        isDraft
+        url
+        updatedAt
+        author { login }
+        repository {
+          name
+          owner { login }
+        }
+      }
+    }
+  }
+  updated: search(query: $updatedQuery, type: ISSUE, first: 100) {
+    nodes {
+      ... on PullRequest {
+        number
+        title
+        state
+        isDraft
+        url
+        updatedAt
+        author { login }
+        repository {
+          name
+          owner { login }
+        }
+      }
+    }
+  }
+}"""
+    variables = {
+        "createdQuery": f"org:{org} author:{user} created:{date_query} type:pr",
+        "updatedQuery": f"org:{org} author:{user} updated:{date_query} type:pr",
+    }
+    return query, variables
+
+
+def _build_commit_check_query(prs_to_check):
+    """Build a GraphQL query to fetch commits for multiple PRs.
+
+    Args:
+        prs_to_check: List of (org, repo, number) tuples.
+
+    Returns:
+        A GraphQL query string with index-based aliases (pr_0, pr_1, ...).
+    """
+    if not prs_to_check:
+        return None
+    fragments = []
+    for i, (org, repo, number) in enumerate(prs_to_check):
+        fragments.append(
+            f'  pr_{i}: repository(owner: "{org}", name: "{repo}") {{\n'
+            f"    pullRequest(number: {number}) {{\n"
+            f"      number\n"
+            f"      commits(first: 100) {{\n"
+            f"        nodes {{\n"
+            f"          commit {{\n"
+            f"            author {{ user {{ login }} date }}\n"
+            f"            committer {{ user {{ login }} date }}\n"
+            f"          }}\n"
+            f"        }}\n"
+            f"      }}\n"
+            f"    }}\n"
+            f"  }}"
+        )
+    return "{\n" + "\n".join(fragments) + "\n}"
+
+
+def _check_commits_in_response(data, prs_to_check, user, date_from, date_to):
+    """Parse commit check response, return set of (org, repo, number) keys with user commits in range.
+
+    Args:
+        data: GraphQL response data dict.
+        prs_to_check: Original list of (org, repo, number) tuples.
+        user: GitHub username.
+        date_from: Start date YYYY-MM-DD.
+        date_to: End date YYYY-MM-DD.
+
+    Returns:
+        Set of (org, repo, number) tuples for PRs with user commits in range.
+    """
+    matched = set()
+    for i, key in enumerate(prs_to_check):
+        alias = f"pr_{i}"
+        repo_data = data.get(alias)
+        if repo_data is None:
+            continue
+        pr_info = repo_data.get("pullRequest")
+        if pr_info is None:
+            continue
+        commits = (pr_info.get("commits") or {}).get("nodes", [])
+        for node in commits:
+            commit = node.get("commit", {})
+            for field in ("author", "committer"):
+                field_data = commit.get(field, {}) or {}
+                user_data = field_data.get("user") or {}
+                login = user_data.get("login", "")
+                commit_date = field_data.get("date", "")
+                if login == user and commit_date and date_from <= commit_date[:10] <= date_to:
+                    matched.add(key)
+                    break
+            else:
+                continue
+            break
+    return matched
+
+
+def _has_review_in_range(pr_node, user, date_from, date_to):
+    """Check if user has review or comment activity within date range."""
+    for review in (pr_node.get("reviews") or {}).get("nodes", []):
+        review_author = (review.get("author") or {}).get("login", "")
+        if review_author == user:
+            submitted = (review.get("submittedAt") or "")[:10]
+            if submitted and date_from <= submitted <= date_to:
+                return True
+
+    for comment in (pr_node.get("comments") or {}).get("nodes", []):
+        comment_author = (comment.get("author") or {}).get("login", "")
+        if comment_author == user:
+            created = (comment.get("createdAt") or "")[:10]
+            if created and date_from <= created <= date_to:
+                return True
+
+    return False
+
+
+def _extract_reviewers(pr_node, user, excluded_bots):
+    """Extract pending reviewers, excluding bots and the user."""
+    reviewers = []
+    for req in (pr_node.get("reviewRequests") or {}).get("nodes", []):
+        reviewer = req.get("requestedReviewer") or {}
+        login = reviewer.get("login") or reviewer.get("slug") or ""
+        if login and login not in excluded_bots and login != user:
+            reviewers.append(login)
+    return reviewers
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
 def main():
     parser = argparse.ArgumentParser(description="Generate daily GitHub PR report")
     parser.add_argument("--org", default="dashpay", help="GitHub organization (default: dashpay)")
@@ -234,6 +264,10 @@ def main():
     parser.add_argument("--date", default=None, help="Date in YYYY-MM-DD format (default: today)")
     parser.add_argument("--from", dest="date_from", default=None, help="Start date in YYYY-MM-DD format (use with --to)")
     parser.add_argument("--to", dest="date_to", default=None, help="End date in YYYY-MM-DD format (use with --from)")
+    parser.add_argument("--config", dest="config_path", default=None, help="Path to config file (default: ~/.config/daily-report/repos.yaml)")
+    parser.add_argument("--repos-dir", dest="repos_dir", default=None, help="Scan directory for repos (overrides config file)")
+    parser.add_argument("--git-email", dest="git_email", default=None, help="Additional git email for author matching")
+    parser.add_argument("--no-local", dest="no_local", action="store_true", help="Force API-only mode (skip local git operations)")
     args = parser.parse_args()
 
     org = args.org
@@ -273,135 +307,300 @@ def main():
 
     is_range = date_from != date_to
 
-    json_fields = ["repository", "title", "number", "state", "isDraft", "url", "updatedAt"]
-    json_fields_with_author = json_fields + ["author"]
+    # Load configuration
+    cfg = load_config(args.config_path)
+    excluded_bots = set(cfg.excluded_bots) if cfg.excluded_bots else set(AI_BOTS)
+    git_emails = list(cfg.git_emails) if cfg.git_emails else []
+    if args.git_email:
+        git_emails.append(args.git_email)
 
-    # Build date query string for gh search
-    date_query = f"{date_from}..{date_to}" if is_range else date_from
+    # Determine available local repos
+    local_repos: list[RepoInfo] = []
+    if not args.no_local:
+        repos_dir = args.repos_dir or cfg.repos_dir
+        if repos_dir:
+            local_repos = discover_repos(repos_dir, org)
+        elif cfg.repos:
+            for rc in cfg.repos:
+                if rc.org.lower() == org.lower() and rc.path:
+                    local_repos.append(RepoInfo(path=rc.path, org=rc.org, name=rc.name))
 
-    # Step 1: Get authored PRs
-    authored_created = gh_search(
-        [f"--author={user}", f"--created={date_query}", f"--owner={org}"],
-        json_fields,
-    )
-    authored_updated = gh_search(
-        [f"--author={user}", f"--updated={date_query}", f"--owner={org}"],
-        json_fields,
-    )
-    authored_prs = deduplicate(authored_created + authored_updated)
+    use_local = len(local_repos) > 0
 
-    authored_keys = {pr_key(pr) for pr in authored_prs}
+    # -----------------------------------------------------------------------
+    # Phase 1: Commit Discovery
+    # -----------------------------------------------------------------------
+    # Keys: (org, repo_name, pr_number)
+    authored_pr_keys: dict[tuple[str, str, int], str] = {}  # key -> role ("authored" | "contributed")
+    authored_pr_authors: dict[tuple[str, str, int], str] = {}  # key -> PR author login
 
-    # Step 2: Get reviewed/commented PRs
-    reviewed = gh_search(
-        [f"--reviewed-by={user}", f"--updated={date_query}", f"--owner={org}"],
-        json_fields_with_author,
-    )
-    commented = gh_search(
-        [f"--commenter={user}", f"--updated={date_query}", f"--owner={org}"],
-        json_fields_with_author,
-    )
-    candidate_prs = deduplicate(reviewed + commented)
-    # Remove authored PRs
-    candidate_prs = [pr for pr in candidate_prs if pr_key(pr) not in authored_keys]
+    local_repo_names: set[str] = set()
 
-    # Step 3: Check for contributions on non-authored PRs
-    contributed_prs = []
-    remaining_prs = []
-    for pr in candidate_prs:
-        repo = repo_name(pr)
-        number = pr["number"]
-        if check_commits_for_user(org, repo, number, user, date_from, date_to):
-            contributed_prs.append(pr)
-        else:
-            remaining_prs.append(pr)
+    if use_local:
+        # Fetch repos in parallel
+        print("Fetching repos...", file=sys.stderr)
+        fetch_repos(local_repos)
 
-    # Step 4: Verify review activity is within date range
-    reviewed_prs = []
-    for pr in remaining_prs:
-        repo = repo_name(pr)
-        number = pr["number"]
-        if check_review_activity(org, repo, number, user, date_from, date_to):
-            reviewed_prs.append(pr)
+        for repo in local_repos:
+            local_repo_names.add(repo.name)
+            # Find commits by user in date range
+            commits = find_commits(
+                repo.path, user, date_from, date_to, git_emails=git_emails or None
+            )
+            if not commits:
+                continue
 
-    # Step 5 & 6: Get stats and merged info for authored/contributed PRs
+            # Extract PR numbers from commit messages
+            pr_map, unmapped = extract_pr_numbers(commits)
+
+            # PRs extracted from commit messages
+            for pr_number in pr_map:
+                key = (repo.org, repo.name, pr_number)
+                if key not in authored_pr_keys:
+                    # We don't know the author yet; will be resolved in Phase 3
+                    authored_pr_keys[key] = "authored"
+
+            # Use GraphQL to map unmapped commits to PRs
+            if unmapped:
+                shas = [c.sha for c in unmapped]
+                # Process in batches of 25
+                for i in range(0, len(shas), 25):
+                    batch = shas[i:i + 25]
+                    try:
+                        query = build_commit_to_pr_query(repo.org, repo.name, batch)
+                        data = graphql_with_retry(query)
+                        sha_to_prs = parse_commit_to_pr_response(data)
+                        for sha, prs in sha_to_prs.items():
+                            for pr in prs:
+                                pr_number = pr.get("number")
+                                if pr_number:
+                                    key = (repo.org, repo.name, pr_number)
+                                    if key not in authored_pr_keys:
+                                        pr_author = (pr.get("author") or {}).get("login", "")
+                                        authored_pr_keys[key] = "authored"
+                                        if pr_author:
+                                            authored_pr_authors[key] = pr_author
+                    except RuntimeError as e:
+                        print(f"Warning: GraphQL commit mapping failed for {repo.name}: {e}", file=sys.stderr)
+
+    # API fallback: search for authored PRs via GraphQL
+    # Always run this to catch PRs in non-cloned repos
+    try:
+        query, variables = _build_authored_search_query(org, user, date_from, date_to)
+        data = graphql_with_retry(query, variables)
+        api_candidate_prs = []
+        seen_api = set()
+        for search_key in ("created", "updated"):
+            for node in (data.get(search_key) or {}).get("nodes", []):
+                if not node:
+                    continue
+                repo_info = node.get("repository") or {}
+                repo_name = repo_info.get("name", "")
+                pr_number = node.get("number")
+                if not repo_name or not pr_number:
+                    continue
+                pr_org = (repo_info.get("owner") or {}).get("login", org)
+                key = (pr_org, repo_name, pr_number)
+                if key not in seen_api:
+                    seen_api.add(key)
+                    api_candidate_prs.append((key, node))
+    except RuntimeError as e:
+        print(f"Warning: authored PR search failed: {e}", file=sys.stderr)
+        api_candidate_prs = []
+
+    # For API-discovered PRs not already found locally, verify commits in date range
+    prs_needing_commit_check = []
+    api_node_map = {}
+    for key, node in api_candidate_prs:
+        if key not in authored_pr_keys:
+            prs_needing_commit_check.append(key)
+            api_node_map[key] = node
+
+    if prs_needing_commit_check:
+        # Batch commit check via GraphQL
+        # Process in batches to avoid query complexity limits
+        batch_size = 15
+        for i in range(0, len(prs_needing_commit_check), batch_size):
+            batch = prs_needing_commit_check[i:i + batch_size]
+            try:
+                query = _build_commit_check_query(batch)
+                if query:
+                    data = graphql_with_retry(query)
+                    matched = _check_commits_in_response(data, batch, user, date_from, date_to)
+                    for key in matched:
+                        authored_pr_keys[key] = "authored"
+            except RuntimeError as e:
+                print(f"Warning: commit check failed: {e}", file=sys.stderr)
+
+    # -----------------------------------------------------------------------
+    # Phase 2: Review Discovery (GraphQL)
+    # -----------------------------------------------------------------------
+    reviewed_pr_keys: set[tuple[str, str, int]] = set()
+    reviewed_pr_data: dict[tuple[str, str, int], dict] = {}
+
+    try:
+        query, variables = build_review_search_query(org, user, date_from, date_to)
+        data = graphql_with_retry(query, variables)
+
+        for search_key in ("reviewed", "commented"):
+            for node in (data.get(search_key) or {}).get("nodes", []):
+                if not node:
+                    continue
+                repo_info = node.get("repository") or {}
+                repo_name = repo_info.get("name", "")
+                pr_number = node.get("number")
+                if not repo_name or not pr_number:
+                    continue
+                pr_org = (repo_info.get("owner") or {}).get("login", org)
+                key = (pr_org, repo_name, pr_number)
+
+                # Skip if already discovered as authored/contributed in Phase 1
+                if key in authored_pr_keys:
+                    continue
+
+                # Verify review/comment activity is within date range
+                if _has_review_in_range(node, user, date_from, date_to):
+                    reviewed_pr_keys.add(key)
+                    reviewed_pr_data[key] = node
+    except RuntimeError as e:
+        print(f"Warning: review discovery failed: {e}", file=sys.stderr)
+
+    # Check for contributions on reviewed PRs (user has commits but is not author)
+    if reviewed_pr_keys:
+        review_prs_to_check = list(reviewed_pr_keys)
+        batch_size = 15
+        for i in range(0, len(review_prs_to_check), batch_size):
+            batch = review_prs_to_check[i:i + batch_size]
+            try:
+                query = _build_commit_check_query(batch)
+                if query:
+                    data = graphql_with_retry(query)
+                    matched = _check_commits_in_response(data, batch, user, date_from, date_to)
+                    for key in matched:
+                        reviewed_pr_keys.discard(key)
+                        authored_pr_keys[key] = "contributed"
+            except RuntimeError as e:
+                print(f"Warning: contribution check failed: {e}", file=sys.stderr)
+
+    # -----------------------------------------------------------------------
+    # Phase 3: Enrichment (GraphQL Batch)
+    # -----------------------------------------------------------------------
+    all_pr_keys = set(authored_pr_keys.keys()) | reviewed_pr_keys
+
+    # Batch fetch PR details
+    pr_details: dict[tuple[str, str, int], dict] = {}
+    if all_pr_keys:
+        details_list = list(all_pr_keys)
+        batch_size = 20
+        for i in range(0, len(details_list), batch_size):
+            batch = details_list[i:i + batch_size]
+            try:
+                query = build_pr_details_query(batch)
+                data = graphql_with_retry(query)
+                parsed = parse_pr_details_response(data, batch)
+                pr_details.update(parsed)
+            except RuntimeError as e:
+                print(f"Warning: PR details fetch failed: {e}", file=sys.stderr)
+
+    # Classify authored vs contributed based on PR author
+    for key in list(authored_pr_keys.keys()):
+        detail = pr_details.get(key)
+        if detail:
+            pr_author = (detail.get("author") or {}).get("login", "")
+            # Also check pre-stored author info from commit mapping
+            if not pr_author:
+                pr_author = authored_pr_authors.get(key, "")
+            if pr_author and pr_author != user:
+                authored_pr_keys[key] = "contributed"
+            elif pr_author == user:
+                authored_pr_keys[key] = "authored"
+
+    # Build authored_details list
     authored_details = []
-    for pr in authored_prs:
-        repo = repo_name(pr)
-        number = pr["number"]
-        state = pr.get("state", "")
-        is_draft = pr.get("isDraft", False)
-        merged_at, api_state = get_merged_info(org, repo, number)
-        status = format_status(api_state or state, is_draft, merged_at)
-        additions, deletions = (0, 0)
-        if status in ("Open", "Draft"):
-            additions, deletions = get_additions_deletions(org, repo, number)
+    for key, role in authored_pr_keys.items():
+        pr_org, repo_name, pr_number = key
+        detail = pr_details.get(key, {})
+        title = detail.get("title", "")
+        state = detail.get("state", "")
+        is_draft = detail.get("isDraft", False)
+        merged_at = detail.get("mergedAt")
+        additions = detail.get("additions", 0) or 0
+        deletions = detail.get("deletions", 0) or 0
+        pr_author = (detail.get("author") or {}).get("login", "")
+        status = format_status(state, is_draft, merged_at)
+        if status not in ("Open", "Draft"):
+            additions, deletions = 0, 0
         authored_details.append({
-            "repo": repo,
-            "title": pr["title"],
-            "number": number,
+            "repo": repo_name,
+            "title": title,
+            "number": pr_number,
             "status": status,
             "additions": additions,
             "deletions": deletions,
-            "contributed": False,
-            "original_author": None,
+            "contributed": role == "contributed",
+            "original_author": pr_author if role == "contributed" else None,
         })
 
-    for pr in contributed_prs:
-        repo = repo_name(pr)
-        number = pr["number"]
-        state = pr.get("state", "")
-        is_draft = pr.get("isDraft", False)
-        merged_at, api_state = get_merged_info(org, repo, number)
-        status = format_status(api_state or state, is_draft, merged_at)
-        additions, deletions = (0, 0)
-        if status in ("Open", "Draft"):
-            additions, deletions = get_additions_deletions(org, repo, number)
-        authored_details.append({
-            "repo": repo,
-            "title": pr["title"],
-            "number": number,
+    # Sort for deterministic output
+    authored_details.sort(key=lambda d: (d["repo"], d["number"]))
+
+    # Build reviewed_prs list
+    reviewed_prs = []
+    for key in sorted(reviewed_pr_keys):
+        pr_org, repo_name, pr_number = key
+        detail = pr_details.get(key, {})
+        title = detail.get("title", "")
+        state = detail.get("state", "")
+        is_draft = detail.get("isDraft", False)
+        merged_at = detail.get("mergedAt")
+        pr_author = (detail.get("author") or {}).get("login", "")
+        status = format_status(state, is_draft, merged_at)
+        reviewed_prs.append({
+            "repo": repo_name,
+            "title": title,
+            "number": pr_number,
+            "author": pr_author,
             "status": status,
-            "additions": additions,
-            "deletions": deletions,
-            "contributed": True,
-            "original_author": pr_author_login(pr),
         })
 
-    # Step 7: Waiting for review
+    # Waiting for review
     waiting_prs = []
     try:
-        open_authored = gh_search(
-            [f"--author={user}", f"--owner={org}", "--state=open"],
-            ["repository", "title", "number", "isDraft", "url", "createdAt"],
-        )
-    except RuntimeError:
-        open_authored = []
+        query, variables = build_waiting_for_review_query(org, user)
+        data = graphql_with_retry(query, variables)
+        for node in (data.get("search") or {}).get("nodes", []):
+            if not node:
+                continue
+            if node.get("isDraft", False):
+                continue
+            repo_info = node.get("repository") or {}
+            repo_name = repo_info.get("name", "")
+            pr_number = node.get("number")
+            if not repo_name or not pr_number:
+                continue
+            reviewers = _extract_reviewers(node, user, excluded_bots)
+            if reviewers:
+                created_at = node.get("createdAt", "")
+                try:
+                    created_date = datetime.strptime(created_at[:10], "%Y-%m-%d").date()
+                    ref_date = datetime.strptime(date_to, "%Y-%m-%d").date()
+                    days_waiting = max(0, (ref_date - created_date).days)
+                except (ValueError, TypeError):
+                    days_waiting = 0
+                waiting_prs.append({
+                    "repo": repo_name,
+                    "title": node.get("title", ""),
+                    "number": pr_number,
+                    "reviewers": reviewers,
+                    "created_at": created_at[:10],
+                    "days_waiting": days_waiting,
+                })
+    except RuntimeError as e:
+        print(f"Warning: waiting for review query failed: {e}", file=sys.stderr)
 
-    for pr in open_authored:
-        if pr.get("isDraft", False):
-            continue
-        repo = repo_name(pr)
-        number = pr["number"]
-        reviewers = get_requested_reviewers(org, repo, number, user)
-        if reviewers:
-            created_at = pr.get("createdAt", "")
-            try:
-                created_date = datetime.strptime(created_at[:10], "%Y-%m-%d").date()
-                ref_date = datetime.strptime(date_to, "%Y-%m-%d").date()
-                days_waiting = max(0, (ref_date - created_date).days)
-            except (ValueError, TypeError):
-                days_waiting = 0
-            waiting_prs.append({
-                "repo": repo,
-                "title": pr["title"],
-                "number": number,
-                "reviewers": reviewers,
-                "created_at": created_at[:10],
-                "days_waiting": days_waiting,
-            })
-
+    # -----------------------------------------------------------------------
     # Build report
+    # -----------------------------------------------------------------------
     all_titles = [d["title"] for d in authored_details] + [pr["title"] for pr in reviewed_prs]
     themes = extract_themes(all_titles)
 
@@ -409,12 +608,12 @@ def main():
     for d in authored_details:
         all_repos.add(d["repo"])
     for pr in reviewed_prs:
-        all_repos.add(repo_name(pr))
+        all_repos.add(pr["repo"])
 
     total_prs = len(authored_details) + len(reviewed_prs)
     merged_today = (
         sum(1 for d in authored_details if d["status"] == "Merged")
-        + sum(1 for pr in reviewed_prs if pr.get("state", "").upper() == "MERGED")
+        + sum(1 for pr in reviewed_prs if pr["status"] == "Merged")
     )
     still_open = sum(1 for d in authored_details if d["status"] in ("Open", "Draft"))
 
@@ -448,13 +647,8 @@ def main():
     lines.append("")
     if reviewed_prs:
         for pr in reviewed_prs:
-            repo = repo_name(pr)
-            author = pr_author_login(pr)
-            state = pr.get("state", "")
-            is_draft = pr.get("isDraft", False)
-            status = format_status(state, is_draft)
             lines.append(
-                f"- `{repo}` \u2014 {pr['title']} #{pr['number']} ({author}) \u2014 **{status}**"
+                f"- `{pr['repo']}` \u2014 {pr['title']} #{pr['number']} ({pr['author']}) \u2014 **{pr['status']}**"
             )
     else:
         lines.append("_No reviewed or approved PRs._")
