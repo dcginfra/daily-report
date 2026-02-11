@@ -26,6 +26,10 @@ from daily_report.graphql_client import (
     build_review_search_query,
     build_waiting_for_review_query,
 )
+from daily_report.report_data import (
+    ReportData, AuthoredPR, ReviewedPR, WaitingPR, SummaryStats,
+)
+from daily_report.format_markdown import format_markdown
 
 
 # AI bots to exclude from reviewer lists
@@ -273,6 +277,14 @@ def main():
     parser.add_argument("--repos-dir", dest="repos_dir", default=None, help="scan directory for git repos; filters by --org if given (overrides config repos list)")
     parser.add_argument("--git-email", dest="git_email", default=None, help="additional git author email for commit matching")
     parser.add_argument("--no-local", dest="no_local", action="store_true", default=False, help="skip local git discovery, use GraphQL-only mode (default: %(default)s)")
+    parser.add_argument(
+        "--slides", action="store_true", default=False,
+        help="generate .pptx slide deck instead of Markdown output",
+    )
+    parser.add_argument(
+        "--slides-output", dest="slides_output", default=None,
+        help="output path for .pptx file (default: auto-generated name in CWD)",
+    )
     args = parser.parse_args()
 
     org = args.org
@@ -308,6 +320,10 @@ def main():
 
     if date_from > date_to:
         print(f"Error: --from date ({date_from}) must be <= --to date ({date_to}).", file=sys.stderr)
+        sys.exit(1)
+
+    if args.slides_output and not args.slides:
+        print("Error: --slides-output requires --slides.", file=sys.stderr)
         sys.exit(1)
 
     is_range = date_from != date_to
@@ -524,8 +540,8 @@ def main():
             elif pr_author == user:
                 authored_pr_keys[key] = "authored"
 
-    # Build authored_details list
-    authored_details = []
+    # Build authored_prs list
+    authored_prs_list: list[AuthoredPR] = []
     for key, role in authored_pr_keys.items():
         pr_org, repo_name, pr_number = key
         detail = pr_details.get(key, {})
@@ -539,22 +555,22 @@ def main():
         status = format_status(state, is_draft, merged_at)
         if status not in ("Open", "Draft"):
             additions, deletions = 0, 0
-        authored_details.append({
-            "repo": repo_name,
-            "title": title,
-            "number": pr_number,
-            "status": status,
-            "additions": additions,
-            "deletions": deletions,
-            "contributed": role == "contributed",
-            "original_author": pr_author if role == "contributed" else None,
-        })
+        authored_prs_list.append(AuthoredPR(
+            repo=repo_name,
+            title=title,
+            number=pr_number,
+            status=status,
+            additions=additions,
+            deletions=deletions,
+            contributed=(role == "contributed"),
+            original_author=pr_author if role == "contributed" else None,
+        ))
 
     # Sort for deterministic output
-    authored_details.sort(key=lambda d: (d["repo"], d["number"]))
+    authored_prs_list.sort(key=lambda d: (d.repo, d.number))
 
     # Build reviewed_prs list
-    reviewed_prs = []
+    reviewed_prs_list: list[ReviewedPR] = []
     for key in sorted(reviewed_pr_keys):
         pr_org, repo_name, pr_number = key
         detail = pr_details.get(key, {})
@@ -564,16 +580,16 @@ def main():
         merged_at = detail.get("mergedAt")
         pr_author = (detail.get("author") or {}).get("login", "")
         status = format_status(state, is_draft, merged_at)
-        reviewed_prs.append({
-            "repo": repo_name,
-            "title": title,
-            "number": pr_number,
-            "author": pr_author,
-            "status": status,
-        })
+        reviewed_prs_list.append(ReviewedPR(
+            repo=repo_name,
+            title=title,
+            number=pr_number,
+            author=pr_author,
+            status=status,
+        ))
 
     # Waiting for review
-    waiting_prs = []
+    waiting_prs_list: list[WaitingPR] = []
     try:
         query, variables = build_waiting_for_review_query(org, user)
         data = graphql_with_retry(query, variables)
@@ -596,96 +612,79 @@ def main():
                     days_waiting = max(0, (ref_date - created_date).days)
                 except (ValueError, TypeError):
                     days_waiting = 0
-                waiting_prs.append({
-                    "repo": repo_name,
-                    "title": node.get("title", ""),
-                    "number": pr_number,
-                    "reviewers": reviewers,
-                    "created_at": created_at[:10],
-                    "days_waiting": days_waiting,
-                })
+                waiting_prs_list.append(WaitingPR(
+                    repo=repo_name,
+                    title=node.get("title", ""),
+                    number=pr_number,
+                    reviewers=reviewers,
+                    created_at=created_at[:10],
+                    days_waiting=days_waiting,
+                ))
     except RuntimeError as e:
         print(f"Warning: waiting for review query failed: {e}", file=sys.stderr)
 
     # -----------------------------------------------------------------------
     # Build report
     # -----------------------------------------------------------------------
-    all_titles = [d["title"] for d in authored_details] + [pr["title"] for pr in reviewed_prs]
+    all_titles = [p.title for p in authored_prs_list] + [p.title for p in reviewed_prs_list]
     themes = extract_themes(all_titles)
 
     all_repos = set()
-    for d in authored_details:
-        all_repos.add(d["repo"])
-    for pr in reviewed_prs:
-        all_repos.add(pr["repo"])
+    for p in authored_prs_list:
+        all_repos.add(p.repo)
+    for p in reviewed_prs_list:
+        all_repos.add(p.repo)
 
-    total_prs = len(authored_details) + len(reviewed_prs)
-    merged_today = (
-        sum(1 for d in authored_details if d["status"] == "Merged")
-        + sum(1 for pr in reviewed_prs if pr["status"] == "Merged")
+    total_prs = len(authored_prs_list) + len(reviewed_prs_list)
+    merged_count = (
+        sum(1 for p in authored_prs_list if p.status == "Merged")
+        + sum(1 for p in reviewed_prs_list if p.status == "Merged")
     )
-    still_open = sum(1 for d in authored_details if d["status"] in ("Open", "Draft"))
+    open_count = sum(1 for p in authored_prs_list if p.status in ("Open", "Draft"))
 
-    lines = []
-    if is_range:
-        lines.append(f"# Daily Report \u2014 {date_from} .. {date_to}")
-    else:
-        lines.append(f"# Daily Report \u2014 {date_from}")
-    lines.append("")
-
-    # Authored / Contributed PRs
-    lines.append("**Authored / Contributed PRs**")
-    lines.append("")
-    if authored_details:
-        for d in authored_details:
-            stats = ""
-            if d["status"] in ("Open", "Draft"):
-                stats = f" (+{d['additions']}/\u2212{d['deletions']})"
-            author_info = ""
-            if d["contributed"] and d["original_author"]:
-                author_info = f" ({d['original_author']})"
-            lines.append(
-                f"- `{d['repo']}` \u2014 {d['title']} #{d['number']}{author_info} \u2014 **{d['status']}**{stats}"
-            )
-    else:
-        lines.append("_No authored or contributed PRs._")
-    lines.append("")
-
-    # Reviewed / Approved PRs
-    lines.append("**Reviewed / Approved PRs**")
-    lines.append("")
-    if reviewed_prs:
-        for pr in reviewed_prs:
-            lines.append(
-                f"- `{pr['repo']}` \u2014 {pr['title']} #{pr['number']} ({pr['author']}) \u2014 **{pr['status']}**"
-            )
-    else:
-        lines.append("_No reviewed or approved PRs._")
-    lines.append("")
-
-    # Waiting for review
-    lines.append("**Waiting for review**")
-    lines.append("")
-    if waiting_prs:
-        for w in waiting_prs:
-            reviewer_names = ", ".join(f"**{r}**" for r in w["reviewers"])
-            lines.append(
-                f"- `{w['repo']}` \u2014 {w['title']} #{w['number']} \u2014 reviewer: {reviewer_names} \u2014 since {w['created_at']} ({w['days_waiting']} days)"
-            )
-    else:
-        lines.append("_No PRs waiting for review._")
-    lines.append("")
-
-    # Summary
-    themes_str = ", ".join(themes) if themes else "general development"
-    merged_label = "merged" if is_range else "merged today"
-    lines.append(
-        f"**Summary:** {total_prs} PRs across {len(all_repos)} repos, "
-        f"{merged_today} {merged_label}, {still_open} still open. "
-        f"Key themes: {themes_str}."
+    report = ReportData(
+        user=user,
+        date_from=date_from,
+        date_to=date_to,
+        authored_prs=authored_prs_list,
+        reviewed_prs=reviewed_prs_list,
+        waiting_prs=waiting_prs_list,
+        summary=SummaryStats(
+            total_prs=total_prs,
+            repo_count=len(all_repos),
+            merged_count=merged_count,
+            open_count=open_count,
+            themes=themes,
+            is_range=is_range,
+        ),
     )
 
-    print("\n".join(lines))
+    # Output
+    if args.slides:
+        # Lazy import -- python-pptx is optional
+        try:
+            from daily_report.format_slides import format_slides
+        except ImportError:
+            print(
+                "Error: python-pptx is required for --slides. "
+                "Install it with: pip install python-pptx",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        if args.slides_output:
+            output_path = args.slides_output
+        else:
+            if date_from == date_to:
+                output_path = f"daily-report-{user}-{date_from}.pptx"
+            else:
+                output_path = f"daily-report-{user}-{date_from}_{date_to}.pptx"
+
+        format_slides(report, output_path)
+        print(f"Slides written to {output_path}", file=sys.stderr)
+    else:
+        output = format_markdown(report)
+        print(output)
 
 
 if __name__ == "__main__":

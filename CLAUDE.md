@@ -9,11 +9,14 @@ Daily GitHub PR report generator. Hybrid local-git + GraphQL architecture (3-pha
 ./test.sh [args]         # run tests (or: python3 -m pytest tests/ -v)
 ```
 
-**Prerequisites:** Python 3.8+, `gh` CLI (authenticated), `pyyaml`
+**Prerequisites:** Python 3.8+, `gh` CLI (authenticated), `pyyaml`, optional `python-pptx` (for `--slides`)
 
 ## Project Structure
 
 - `daily_report/` — main package, source code of the app
+  - `report_data.py` — structured data model (`ReportData`, `AuthoredPR`, `ReviewedPR`, `WaitingPR`, `SummaryStats`)
+  - `format_markdown.py` — Markdown formatter (pure function, returns string)
+  - `format_slides.py` — PPTX slide deck formatter (requires `python-pptx`, writes file)
 - `tests/` — `test_date_range.py` (functional, live GitHub), `test_graphql_client.py` (unit, mocked)
 - `tests/scenarios/` — test case documentation
 - `docs/` — design and research documents
@@ -34,7 +37,8 @@ Three phases: **local git discovery** → **GraphQL review search** → **GraphQ
 - **Before committing:** always run `./test.sh` — all tests must pass
 - **Mock paths:** use full package prefix, e.g. `daily_report.graphql_client.subprocess.run`
 - **External commands:** via `subprocess.run()` with `capture_output=True`
-- **Data models:** dataclasses (`RepoInfo`, `GitCommit`, `RepoConfig`, `Config`)
+- **Data models:** dataclasses (`RepoInfo`, `GitCommit`, `RepoConfig`, `Config`, `ReportData`, `AuthoredPR`, `ReviewedPR`, `WaitingPR`, `SummaryStats`)
+- **Optional dependencies:** use lazy import pattern (import inside conditional block in `__main__.py`, not at module top level) — see `format_slides` for example
 
 ## Known Gotchas
 

@@ -34,6 +34,12 @@ python -m daily_report --config ~/.config/daily-report/repos.yaml
 
 # Force API-only mode (skip local git)
 python -m daily_report --no-local
+
+# Generate a .pptx slide deck (requires: pip install python-pptx)
+python -m daily_report --slides --from 2026-01-26 --to 2026-02-06
+
+# Specify a custom output path for the slide deck
+python -m daily_report --slides --slides-output ~/presentations/sprint-review.pptx --from 2026-01-26 --to 2026-02-06
 ```
 
 ## Options
@@ -49,8 +55,30 @@ python -m daily_report --no-local
 | `--repos-dir` | *(none)* | Scan directory for git repos, filters by `--org` if given (overrides config repos list) |
 | `--git-email` | *(none)* | Additional git author email for commit matching |
 | `--no-local` | `false` | Skip local git discovery, use GraphQL-only mode |
+| `--slides` | `false` | Generate `.pptx` slide deck instead of Markdown output |
+| `--slides-output` | *(auto-generated)* | Custom output path for `.pptx` file (requires `--slides`) |
 
 `--date` and `--from`/`--to` are mutually exclusive. When neither is provided, defaults to today.
+
+## Slides Export
+
+The `--slides` flag generates a `.pptx` (PowerPoint) slide deck instead of the default Markdown output. This is useful for bi-weekly sprint presentations — the generated file can be uploaded directly to Google Slides via Google Drive or "File > Import slides".
+
+**Requires** the optional `python-pptx` dependency:
+
+```bash
+pip install python-pptx
+```
+
+If `python-pptx` is not installed, using `--slides` prints a clear error message and exits.
+
+The slide deck contains:
+
+1. **Title slide** — "Activity Report" with the GitHub username and date range.
+2. **Per-project slides** — one slide per repository with activity, listing authored/contributed PRs, reviewed PRs, and PRs waiting for review under grouped subheadings.
+3. **Summary slide** — aggregate metrics (total PRs, repos, merged count, open count, key themes).
+
+By default, the output file is written to the current directory with the name `daily-report-{user}-{date}.pptx` (or `daily-report-{user}-{from}_{to}.pptx` for date ranges). Use `--slides-output` to specify a custom path.
 
 ## Configuration
 
