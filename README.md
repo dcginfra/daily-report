@@ -11,7 +11,7 @@ Daily GitHub PR report generator. Uses local git repos and GitHub GraphQL API to
 ## Usage
 
 ```bash
-# Default: dashpay org, authenticated user, today
+# Default: all orgs, authenticated user, today
 python -m daily_report
 
 # Specific date
@@ -20,7 +20,10 @@ python -m daily_report --date 2026-02-10
 # Date range (inclusive)
 python -m daily_report --from 2026-02-01 --to 2026-02-07
 
-# Different org or user
+# Filter to a specific org
+python -m daily_report --org dashpay
+
+# Different org and user
 python -m daily_report --org myorg --user someone
 
 # Use local git repos from a directory (fastest mode)
@@ -37,13 +40,13 @@ python -m daily_report --no-local
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--org` | `dashpay` | GitHub organization to report on |
+| `--org` | *(none — all orgs)* | GitHub organization to report on |
 | `--user` | authenticated `gh` user | GitHub username to report for |
 | `--date` | today | Single date in `YYYY-MM-DD` format; mutually exclusive with `--from`/`--to` |
 | `--from` | *(none)* | Start of date range in `YYYY-MM-DD` format (requires `--to`) |
 | `--to` | *(none)* | End of date range in `YYYY-MM-DD` format (requires `--from`) |
 | `--config` | `~/.config/daily-report/repos.yaml` | Path to YAML config file |
-| `--repos-dir` | *(none)* | Scan directory for git repos matching `--org` (overrides config repos list) |
+| `--repos-dir` | *(none)* | Scan directory for git repos, filters by `--org` if given (overrides config repos list) |
 | `--git-email` | *(none)* | Additional git author email for commit matching |
 | `--no-local` | `false` | Skip local git discovery, use GraphQL-only mode |
 
@@ -78,7 +81,7 @@ repos:
     name: platform
 ```
 
-Alternatively, use `--repos-dir ~/git` to auto-discover all repos in a directory that match the target `--org`.
+Alternatively, use `--repos-dir ~/git` to auto-discover all repos in a directory, filtered by `--org` if given.
 
 ## How it works
 

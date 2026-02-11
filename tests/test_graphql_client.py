@@ -301,6 +301,17 @@ class TestReviewSearchQuery:
         assert "repository" in query
         assert "owner { login }" in query
 
+    def test_none_org_omits_org_filter(self):
+        query, variables = build_review_search_query(
+            None, "lklimek", "2026-02-03", "2026-02-09"
+        )
+        assert "ReviewDiscovery" in query
+        assert "org:" not in variables["reviewQuery"]
+        assert "org:" not in variables["commentQuery"]
+        assert "reviewed-by:lklimek" in variables["reviewQuery"]
+        assert "commenter:lklimek" in variables["commentQuery"]
+        assert "2026-02-03..2026-02-09" in variables["reviewQuery"]
+
 
 # ---------------------------------------------------------------------------
 # build_waiting_for_review_query
@@ -323,3 +334,10 @@ class TestWaitingForReviewQuery:
         assert "requestedReviewer" in query
         assert "... on User { login }" in query
         assert "... on Team { name slug }" in query
+
+    def test_none_org_omits_org_filter(self):
+        query, variables = build_waiting_for_review_query(None, "lklimek")
+        assert "WaitingForReview" in query
+        assert "org:" not in variables["searchQuery"]
+        assert "author:lklimek" in variables["searchQuery"]
+        assert "state:open" in variables["searchQuery"]

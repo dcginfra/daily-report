@@ -234,12 +234,12 @@ def parse_commit_to_pr_response(data: dict) -> dict[str, list[dict]]:
 
 
 def build_review_search_query(
-    org: str, user: str, date_from: str, date_to: str
+    org: str | None, user: str, date_from: str, date_to: str
 ) -> tuple[str, dict]:
     """Build a GraphQL search query for review/comment activity.
 
     Args:
-        org: GitHub organization.
+        org: GitHub organization, or None to search across all orgs.
         user: GitHub username.
         date_from: Start date (YYYY-MM-DD).
         date_to: End date (YYYY-MM-DD).
@@ -302,13 +302,14 @@ query ReviewDiscovery($reviewQuery: String!, $commentQuery: String!) {
     }
   }
 }"""
+    org_filter = f"org:{org} " if org else ""
     variables = {
         "reviewQuery": (
-            f"org:{org} reviewed-by:{user} "
+            f"{org_filter}reviewed-by:{user} "
             f"updated:{date_from}..{date_to} type:pr"
         ),
         "commentQuery": (
-            f"org:{org} commenter:{user} "
+            f"{org_filter}commenter:{user} "
             f"updated:{date_from}..{date_to} type:pr"
         ),
     }
@@ -316,7 +317,7 @@ query ReviewDiscovery($reviewQuery: String!, $commentQuery: String!) {
 
 
 def build_waiting_for_review_query(
-    org: str, user: str
+    org: str | None, user: str
 ) -> tuple[str, dict]:
     """Build a GraphQL query for open PRs awaiting review.
 
@@ -324,7 +325,7 @@ def build_waiting_for_review_query(
     pending review requests.
 
     Args:
-        org: GitHub organization.
+        org: GitHub organization, or None to search across all orgs.
         user: GitHub username.
 
     Returns:
@@ -356,9 +357,10 @@ query WaitingForReview($searchQuery: String!) {
     }
   }
 }"""
+    org_filter = f"org:{org} " if org else ""
     variables = {
         "searchQuery": (
-            f"org:{org} author:{user} state:open type:pr draft:false"
+            f"{org_filter}author:{user} state:open type:pr draft:false"
         ),
     }
     return query, variables

@@ -87,16 +87,18 @@ def _get_remote_url(repo_path: str) -> str | None:
     return None
 
 
-def discover_repos(repos_dir: str, target_org: str) -> list[RepoInfo]:
-    """Scan a directory for git repos belonging to a target GitHub organization.
+def discover_repos(repos_dir: str, target_org: str | None = None) -> list[RepoInfo]:
+    """Scan a directory for git repos, optionally filtering by GitHub organization.
 
     Scans immediate subdirectories of repos_dir for .git/ directories, reads
-    the origin remote URL, and includes only repos whose org matches target_org
-    (case-insensitive).
+    the origin remote URL, and includes repos whose org matches target_org
+    (case-insensitive). When target_org is None, all discovered repos are
+    returned without filtering.
 
     Args:
         repos_dir: Path to the directory containing git repositories.
         target_org: GitHub organization to filter by (e.g. "dashpay").
+            When None, no org filtering is applied.
 
     Returns:
         List of RepoInfo for matching repositories.
@@ -111,7 +113,7 @@ def discover_repos(repos_dir: str, target_org: str) -> list[RepoInfo]:
         return []
 
     results: list[RepoInfo] = []
-    target_org_lower = target_org.lower()
+    target_org_lower = target_org.lower() if target_org else None
 
     try:
         entries = sorted(os.listdir(repos_dir))
@@ -146,7 +148,7 @@ def discover_repos(repos_dir: str, target_org: str) -> list[RepoInfo]:
             continue
 
         org, name = parsed
-        if org.lower() == target_org_lower:
+        if target_org_lower is None or org.lower() == target_org_lower:
             results.append(RepoInfo(path=real_path, org=org, name=name))
 
     return results

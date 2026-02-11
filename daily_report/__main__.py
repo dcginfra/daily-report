@@ -146,9 +146,10 @@ query AuthoredSearch($createdQuery: String!, $updatedQuery: String!) {
     }
   }
 }"""
+    org_filter = f"org:{org} " if org else ""
     variables = {
-        "createdQuery": f"org:{org} author:{user} created:{date_query} type:pr",
-        "updatedQuery": f"org:{org} author:{user} updated:{date_query} type:pr",
+        "createdQuery": f"{org_filter}author:{user} created:{date_query} type:pr",
+        "updatedQuery": f"{org_filter}author:{user} updated:{date_query} type:pr",
     }
     return query, variables
 
@@ -263,13 +264,13 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="--date and --from/--to are mutually exclusive. When neither is given, defaults to today.",
     )
-    parser.add_argument("--org", default="dashpay", help="GitHub organization (default: %(default)s)")
+    parser.add_argument("--org", default=None, help="GitHub organization; omit to search all orgs (default: all)")
     parser.add_argument("--user", default=None, help="GitHub username (default: authenticated `gh` user)")
     parser.add_argument("--date", default=None, help="single date, YYYY-MM-DD (default: today); mutually exclusive with --from/--to")
     parser.add_argument("--from", dest="date_from", default=None, help="start of date range, YYYY-MM-DD (requires --to)")
     parser.add_argument("--to", dest="date_to", default=None, help="end of date range, YYYY-MM-DD (requires --from)")
     parser.add_argument("--config", dest="config_path", default=None, help="path to YAML config file (default: ~/.config/daily-report/repos.yaml)")
-    parser.add_argument("--repos-dir", dest="repos_dir", default=None, help="scan directory for git repos matching --org (overrides config repos list)")
+    parser.add_argument("--repos-dir", dest="repos_dir", default=None, help="scan directory for git repos; filters by --org if given (overrides config repos list)")
     parser.add_argument("--git-email", dest="git_email", default=None, help="additional git author email for commit matching")
     parser.add_argument("--no-local", dest="no_local", action="store_true", default=False, help="skip local git discovery, use GraphQL-only mode (default: %(default)s)")
     args = parser.parse_args()
@@ -326,7 +327,7 @@ def main():
             local_repos = discover_repos(repos_dir, org)
         elif cfg.repos:
             for rc in cfg.repos:
-                if rc.org.lower() == org.lower() and rc.path:
+                if rc.path and (org is None or rc.org.lower() == org.lower()):
                     local_repos.append(RepoInfo(path=rc.path, org=rc.org, name=rc.name))
 
     use_local = len(local_repos) > 0
@@ -403,7 +404,9 @@ def main():
                 pr_number = node.get("number")
                 if not repo_name or not pr_number:
                     continue
-                pr_org = (repo_info.get("owner") or {}).get("login", org)
+                pr_org = (repo_info.get("owner") or {}).get("login", "")
+                if not pr_org:
+                    continue
                 key = (pr_org, repo_name, pr_number)
                 if key not in seen_api:
                     seen_api.add(key)
@@ -455,7 +458,9 @@ def main():
                 pr_number = node.get("number")
                 if not repo_name or not pr_number:
                     continue
-                pr_org = (repo_info.get("owner") or {}).get("login", org)
+                pr_org = (repo_info.get("owner") or {}).get("login", "")
+                if not pr_org:
+                    continue
                 key = (pr_org, repo_name, pr_number)
 
                 # Skip if already discovered as authored/contributed in Phase 1
