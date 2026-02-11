@@ -37,15 +37,15 @@ python -m daily_report --no-local
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--org` | `dashpay` | GitHub organization |
-| `--user` | authenticated user | GitHub username |
-| `--date` | today | Single date in YYYY-MM-DD format |
-| `--from` | — | Start date for range mode (requires `--to`) |
-| `--to` | — | End date for range mode (requires `--from`) |
-| `--config` | `~/.config/daily-report/repos.yaml` | Path to config file |
-| `--repos-dir` | — | Scan directory for git repos matching the org |
-| `--git-email` | — | Additional git email for author matching |
-| `--no-local` | off | Force API-only mode (skip local git operations) |
+| `--org` | `dashpay` | GitHub organization to report on |
+| `--user` | authenticated `gh` user | GitHub username to report for |
+| `--date` | today | Single date in `YYYY-MM-DD` format; mutually exclusive with `--from`/`--to` |
+| `--from` | *(none)* | Start of date range in `YYYY-MM-DD` format (requires `--to`) |
+| `--to` | *(none)* | End of date range in `YYYY-MM-DD` format (requires `--from`) |
+| `--config` | `~/.config/daily-report/repos.yaml` | Path to YAML config file |
+| `--repos-dir` | *(none)* | Scan directory for git repos matching `--org` (overrides config repos list) |
+| `--git-email` | *(none)* | Additional git author email for commit matching |
+| `--no-local` | `false` | Skip local git discovery, use GraphQL-only mode |
 
 `--date` and `--from`/`--to` are mutually exclusive. When neither is provided, defaults to today.
 

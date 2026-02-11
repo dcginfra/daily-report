@@ -258,16 +258,20 @@ def _extract_reviewers(pr_node, user, excluded_bots):
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate daily GitHub PR report")
-    parser.add_argument("--org", default="dashpay", help="GitHub organization (default: dashpay)")
-    parser.add_argument("--user", default=None, help="GitHub username (default: authenticated user)")
-    parser.add_argument("--date", default=None, help="Date in YYYY-MM-DD format (default: today)")
-    parser.add_argument("--from", dest="date_from", default=None, help="Start date in YYYY-MM-DD format (use with --to)")
-    parser.add_argument("--to", dest="date_to", default=None, help="End date in YYYY-MM-DD format (use with --from)")
-    parser.add_argument("--config", dest="config_path", default=None, help="Path to config file (default: ~/.config/daily-report/repos.yaml)")
-    parser.add_argument("--repos-dir", dest="repos_dir", default=None, help="Scan directory for repos (overrides config file)")
-    parser.add_argument("--git-email", dest="git_email", default=None, help="Additional git email for author matching")
-    parser.add_argument("--no-local", dest="no_local", action="store_true", help="Force API-only mode (skip local git operations)")
+    parser = argparse.ArgumentParser(
+        description="Generate daily GitHub PR report",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="--date and --from/--to are mutually exclusive. When neither is given, defaults to today.",
+    )
+    parser.add_argument("--org", default="dashpay", help="GitHub organization (default: %(default)s)")
+    parser.add_argument("--user", default=None, help="GitHub username (default: authenticated `gh` user)")
+    parser.add_argument("--date", default=None, help="single date, YYYY-MM-DD (default: today); mutually exclusive with --from/--to")
+    parser.add_argument("--from", dest="date_from", default=None, help="start of date range, YYYY-MM-DD (requires --to)")
+    parser.add_argument("--to", dest="date_to", default=None, help="end of date range, YYYY-MM-DD (requires --from)")
+    parser.add_argument("--config", dest="config_path", default=None, help="path to YAML config file (default: ~/.config/daily-report/repos.yaml)")
+    parser.add_argument("--repos-dir", dest="repos_dir", default=None, help="scan directory for git repos matching --org (overrides config repos list)")
+    parser.add_argument("--git-email", dest="git_email", default=None, help="additional git author email for commit matching")
+    parser.add_argument("--no-local", dest="no_local", action="store_true", default=False, help="skip local git discovery, use GraphQL-only mode (default: %(default)s)")
     args = parser.parse_args()
 
     org = args.org
