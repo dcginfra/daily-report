@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from graphql_client import (
+from daily_report.graphql_client import (
     build_commit_to_pr_query,
     build_pr_details_query,
     build_review_search_query,
@@ -28,7 +28,7 @@ from graphql_client import (
 class TestGraphqlQuery:
     """Tests for the graphql_query function."""
 
-    @patch("graphql_client.subprocess.run")
+    @patch("daily_report.graphql_client.subprocess.run")
     def test_basic_query(self, mock_run):
         mock_run.return_value = MagicMock(
             stdout=json.dumps({"data": {"viewer": {"login": "testuser"}}}),
@@ -40,7 +40,7 @@ class TestGraphqlQuery:
         cmd = mock_run.call_args[0][0]
         assert cmd[:3] == ["gh", "api", "graphql"]
 
-    @patch("graphql_client.subprocess.run")
+    @patch("daily_report.graphql_client.subprocess.run")
     def test_query_with_variables(self, mock_run):
         mock_run.return_value = MagicMock(
             stdout=json.dumps({"data": {"repository": {}}}),
@@ -59,7 +59,7 @@ class TestGraphqlQuery:
         ]
         assert any(f.startswith("owner=") for f in f_flags)
 
-    @patch("graphql_client.subprocess.run")
+    @patch("daily_report.graphql_client.subprocess.run")
     def test_rate_limit_error_raises(self, mock_run):
         mock_run.return_value = MagicMock(
             stdout=json.dumps({
@@ -71,7 +71,7 @@ class TestGraphqlQuery:
         with pytest.raises(Exception, match="[Rr]ate"):
             graphql_query("{ viewer { login } }")
 
-    @patch("graphql_client.subprocess.run")
+    @patch("daily_report.graphql_client.subprocess.run")
     def test_non_rate_limit_error_raises_runtime(self, mock_run):
         mock_run.return_value = MagicMock(
             stdout=json.dumps({
@@ -83,7 +83,7 @@ class TestGraphqlQuery:
         with pytest.raises(RuntimeError, match="not found"):
             graphql_query("{ viewer { login } }")
 
-    @patch("graphql_client.subprocess.run")
+    @patch("daily_report.graphql_client.subprocess.run")
     def test_subprocess_failure_raises(self, mock_run):
         import subprocess
         mock_run.side_effect = subprocess.CalledProcessError(
@@ -100,17 +100,17 @@ class TestGraphqlQuery:
 class TestGraphqlWithRetry:
     """Tests for the graphql_with_retry function."""
 
-    @patch("graphql_client.graphql_query")
+    @patch("daily_report.graphql_client.graphql_query")
     def test_success_no_retry(self, mock_query):
         mock_query.return_value = {"viewer": {"login": "testuser"}}
         result = graphql_with_retry("{ viewer { login } }")
         assert result == {"viewer": {"login": "testuser"}}
         assert mock_query.call_count == 1
 
-    @patch("graphql_client.time.sleep")
-    @patch("graphql_client.graphql_query")
+    @patch("daily_report.graphql_client.time.sleep")
+    @patch("daily_report.graphql_client.graphql_query")
     def test_retry_on_rate_limit(self, mock_query, mock_sleep):
-        from graphql_client import _RateLimitError
+        from daily_report.graphql_client import _RateLimitError
         mock_query.side_effect = [
             _RateLimitError("rate limited"),
             {"viewer": {"login": "testuser"}},
@@ -120,10 +120,10 @@ class TestGraphqlWithRetry:
         assert mock_query.call_count == 2
         mock_sleep.assert_called_once_with(1)  # 2^0 = 1
 
-    @patch("graphql_client.time.sleep")
-    @patch("graphql_client.graphql_query")
+    @patch("daily_report.graphql_client.time.sleep")
+    @patch("daily_report.graphql_client.graphql_query")
     def test_max_retries_exceeded(self, mock_query, mock_sleep):
-        from graphql_client import _RateLimitError
+        from daily_report.graphql_client import _RateLimitError
         mock_query.side_effect = _RateLimitError("rate limited")
         with pytest.raises(RuntimeError, match="rate limit exceeded after retries"):
             graphql_with_retry("{ viewer { login } }", max_retries=3)
@@ -131,7 +131,7 @@ class TestGraphqlWithRetry:
         # Backoff: 2^0=1, 2^1=2 (third attempt raises immediately)
         assert mock_sleep.call_count == 2
 
-    @patch("graphql_client.graphql_query")
+    @patch("daily_report.graphql_client.graphql_query")
     def test_non_rate_limit_error_not_retried(self, mock_query):
         mock_query.side_effect = RuntimeError("NOT_FOUND")
         with pytest.raises(RuntimeError, match="NOT_FOUND"):
@@ -148,7 +148,7 @@ class TestPRDetailsQuery:
 
     def test_build_single_pr(self):
         query = build_pr_details_query([("dashpay", "platform", 42)])
-        assert "pr_platform_42" in query
+        assert "pr_0:" in query
         assert 'owner: "dashpay"' in query
         assert 'name: "platform"' in query
         assert "pullRequest(number: 42)" in query
@@ -163,18 +163,20 @@ class TestPRDetailsQuery:
             ("dashpay", "tenderdash", 12),
         ]
         query = build_pr_details_query(prs)
-        assert "pr_platform_42" in query
-        assert "pr_platform_55" in query
-        assert "pr_tenderdash_12" in query
+        assert "pr_0:" in query
+        assert "pr_1:" in query
+        assert "pr_2:" in query
 
     def test_build_hyphenated_repo_name(self):
         query = build_pr_details_query([("dashpay", "dash-evo-tool", 100)])
-        # Hyphens replaced with underscores in alias
-        assert "pr_dash_evo_tool_100" in query
+        # Index-based alias, no name mangling needed
+        assert "pr_0:" in query
+        assert 'name: "dash-evo-tool"' in query
 
     def test_parse_response(self):
+        prs = [("dashpay", "platform", 42)]
         data = {
-            "pr_platform_42": {
+            "pr_0": {
                 "pullRequest": {
                     "number": 42,
                     "title": "Fix bug",
@@ -188,20 +190,22 @@ class TestPRDetailsQuery:
                 }
             }
         }
-        result = parse_pr_details_response(data)
+        result = parse_pr_details_response(data, prs)
         assert ("dashpay", "platform", 42) in result
         pr = result[("dashpay", "platform", 42)]
         assert pr["title"] == "Fix bug"
         assert pr["state"] == "MERGED"
 
     def test_parse_response_null_repo(self):
-        data = {"pr_platform_42": None}
-        result = parse_pr_details_response(data)
+        prs = [("dashpay", "platform", 42)]
+        data = {"pr_0": None}
+        result = parse_pr_details_response(data, prs)
         assert len(result) == 0
 
     def test_parse_response_null_pr(self):
-        data = {"pr_platform_42": {"pullRequest": None}}
-        result = parse_pr_details_response(data)
+        prs = [("dashpay", "platform", 42)]
+        data = {"pr_0": {"pullRequest": None}}
+        result = parse_pr_details_response(data, prs)
         assert len(result) == 0
 
 
@@ -308,10 +312,10 @@ class TestWaitingForReviewQuery:
     def test_returns_query_and_variables(self):
         query, variables = build_waiting_for_review_query("dashpay", "lklimek")
         assert "WaitingForReview" in query
-        assert "query" in variables
-        assert "author:lklimek" in variables["query"]
-        assert "state:open" in variables["query"]
-        assert "draft:false" in variables["query"]
+        assert "searchQuery" in variables
+        assert "author:lklimek" in variables["searchQuery"]
+        assert "state:open" in variables["searchQuery"]
+        assert "draft:false" in variables["searchQuery"]
 
     def test_query_contains_review_request_fields(self):
         query, _ = build_waiting_for_review_query("dashpay", "lklimek")
