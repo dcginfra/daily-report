@@ -1,0 +1,83 @@
+name: Daily GitHub Activity Report
+
+on:
+  schedule:
+    - cron: "0 10 * * 1-5"  # 10:00 UTC, Monday-Friday
+  workflow_dispatch:
+    inputs:
+      date:
+        description: "Report date (YYYY-MM-DD). Leave blank for today."
+        required: false
+        default: ""
+      users:
+        description: "Comma-separated GitHub usernames to report. Leave blank to use matrix list."
+        required: false
+        default: ""
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GH_REPORT_TOKEN }}
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+    strategy:
+      fail-fast: false
+      matrix:
+        user: [ktechmidas, lklimek, PastaPastaPasta, QuantumExplorer, shumkov, Silvanasss, UdjinM6, vivekgsharma, ross-dash, HashEngineering, bezibalazs, pelsae]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Resolve date and users
+        id: vars
+        shell: bash
+        run: |
+          run_date=${{ github.event.inputs.date }}
+          if [[ -z "$run_date" ]]; then
+            run_date=$(date -I)
+          fi
+
+          user_list=${{ github.event.inputs.users }}
+          if [[ -n "$user_list" ]]; then
+            # Overwrite matrix when users passed via manual dispatch
+            echo "users=$user_list" >> $GITHUB_OUTPUT
+          else
+            echo "users=${{ matrix.user }}" >> $GITHUB_OUTPUT
+          fi
+
+          echo "date=$run_date" >> $GITHUB_OUTPUT
+
+      - name: Run report for each user
+        shell: bash
+        run: |
+          IFS=',' read -ra USERS <<< "${{ steps.vars.outputs.users }}"
+          for u in "${USERS[@]}"; do
+            u_trimmed=$(echo "$u" | xargs)
+            if [[ -z "$u_trimmed" ]]; then
+              continue
+            fi
+            echo "Running report for $u_trimmed on ${{ steps.vars.outputs.date }}"
+            python -m daily_report \
+              --org dashpay \
+              --date "${{ steps.vars.outputs.date }}" \
+              --user "$u_trimmed" \
+              --no-local \
+              --slack
+          done
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: daily-report-logs
+          path: "**/daily_report/*.log"
+          if-no-files-found: ignore
